@@ -1,0 +1,911 @@
+{
+  "name": "Support SLA Engine (business-hours clocks, pause/resume, escalation, daily report)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Support SLA Engine\nTracks first-response and resolution SLAs in **business time** (time zone, working hours, weekends and holidays), with pause while waiting for the customer, and escalates automatically.\n\n**Events in:** `POST /webhook/sla-event` (Header Auth) with `{type, external_id, ...}`:\n`created` (subject, customer, priority, assignee), `first_response`, `pause`, `resume`, `resolve`. Call it from your helpdesk, a form or another workflow.\n**Every 5 minutes:** scans open tickets and alerts **once** per ticket and clock when 80 % of the target is used (at risk) and when it is breached.\n**Daily 09:00:** compliance report per priority.\n\n**Before running:** run `sql/schema.sql`, set your calendar and holidays (`sql/example_setup.sql`), create credentials (Postgres, Telegram, Header Auth 'SLA webhook key'), replace `REPLACE_WITH_SUPPORT_CHAT_ID` and `REPLACE_ID`, set the Error Workflow to this workflow.",
+        "height": 480,
+        "width": 780,
+        "color": 4
+      },
+      "id": "7fd2c495-0579-42e2-923c-e859bbb3b1a5",
+      "name": "Notes - General",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -440
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Clock rules\n- Open: both clocks run. Pause (waiting on customer): clocks stop, remaining business minutes are saved. Resume: due times are recomputed from now.\n- First response needs an open ticket. Resolving a ticket with no response counts the resolution as the first response.\n- Every change uses optimistic locking (`version`). A concurrent change answers `409`: just retry.\n- `urgent` uses a 24x7 calendar by default; every other priority uses business time.",
+        "height": 240,
+        "width": 560,
+        "color": 5
+      },
+      "id": "106603ae-84df-42a9-824d-4499f325fdf2",
+      "name": "Notes - Rules",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sla-event",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "53c9d76a-52c1-4320-8b74-138d7cd427da",
+      "name": "Webhook SLA Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "SLA webhook key"
+        }
+      },
+      "webhookId": "26a1e80c-7561-48db-a7fb-00c8b8d96f69"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b = ($input.first().json || {}).body;\nconst bad = error => [{ json: { valid: false, error } }];\nif (!b || typeof b !== 'object' || Array.isArray(b)) return bad('JSON object body required');\nconst TYPES = ['created', 'first_response', 'pause', 'resume', 'resolve'];\nif (!TYPES.includes(b.type)) return bad('type must be one of: ' + TYPES.join(', '));\nif (typeof b.external_id !== 'string' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(b.external_id)) return bad('external_id must be 1-100 characters of A-Z a-z 0-9 _ . : -');\nconst clean = (v, max) => typeof v === 'string' ? v.replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').trim().slice(0, max) : '';\nconst out = { valid: true, type: b.type, external_id: b.external_id, subject: '', customer: '', priority: '', assignee: '' };\nif (b.type === 'created') {\n  out.subject = clean(b.subject, 200);\n  if (!out.subject) return bad('subject is required for \"created\"');\n  out.customer = clean(b.customer, 100);\n  out.assignee = clean(b.assignee, 100);\n  out.priority = b.priority === undefined ? 'normal' : String(b.priority).toLowerCase();\n  if (!/^[a-z]{3,20}$/.test(out.priority)) return bad('priority must be 3-20 lowercase letters');\n}\nreturn [{ json: out }];"
+      },
+      "id": "85204557-3d4e-4e26-b45b-1e6db0846a4d",
+      "name": "Parse Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fcf5ff3d-1e85-476a-97a6-901722155693",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "86605131-d9bb-400b-bd2f-2e8bfb211bbe",
+      "name": "Event Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $json.error } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "05bd03fb-5aad-424d-b36f-f314cdf37861",
+      "name": "Respond Bad Event",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, external_id, priority, status, version, first_response_at, response_met, resolved_at, resolution_met,\n       response_remaining_min, resolution_remaining_min, response_due_at, resolution_due_at\nFROM tickets WHERE external_id = $1::text;",
+        "options": {
+          "queryReplacement": "={{ [ $json.external_id ] }}"
+        }
+      },
+      "id": "b8a56b86-dd0d-4e75-958e-3e3bd5801b16",
+      "name": "Find Ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.priority, p.first_response_min, p.resolution_min, p.calendar,\n       c.timezone, c.work_days, c.start_minute, c.end_minute,\n       COALESCE((SELECT array_agg(to_char(h.day, 'YYYY-MM-DD')) FROM holidays h\n                 WHERE h.day BETWEEN current_date - 7 AND current_date + 400), ARRAY[]::text[]) AS holidays\nFROM sla_policies p CROSS JOIN business_calendar c\nWHERE p.priority = $1::text;",
+        "options": {
+          "queryReplacement": "={{ [ $json.priority || $('Parse Event').first().json.priority || '' ] }}"
+        }
+      },
+      "id": "7448cc4c-36ec-4292-8ddb-9cc2f789827a",
+      "name": "Load Policy and Calendar",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1040,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- business calendar maths (time zone and DST aware, no external libraries) ----------\nconst _fmt = {};\nconst partsOf = (ms, tz) => {\n  const f = _fmt[tz] || (_fmt[tz] = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hourCycle: 'h23',\n    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }));\n  const o = {};\n  for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n  return { y: +o.year, m: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, s: +o.second };\n};\nconst tzOffsetMs = (ms, tz) => {\n  const p = partsOf(ms, tz);\n  return Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000;\n};\n// Wall-clock time in a zone -> UTC milliseconds (two passes settle the offset around DST changes)\nconst localToUtc = (y, m, d, minutes, tz) => {\n  const wall = Date.UTC(y, m - 1, d, 0, minutes);\n  const first = wall - tzOffsetMs(wall, tz);\n  return wall - tzOffsetMs(first, tz);\n};\nconst pad2 = n => String(n).padStart(2, '0');\nconst buildCal = (row, policyCalendar) => {\n  if (policyCalendar === '24x7') return { type: '24x7' };\n  const tz = String(row.timezone || '');\n  try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); } catch (e) { throw new Error('invalid time zone \"' + tz + '\"'); }\n  const workDays = (Array.isArray(row.work_days) ? row.work_days : []).map(Number).filter(n => n >= 1 && n <= 7);\n  const startMin = Number(row.start_minute), endMin = Number(row.end_minute);\n  if (!workDays.length) throw new Error('no working days configured');\n  if (!(startMin >= 0 && endMin <= 1440 && startMin < endMin)) throw new Error('invalid working hours');\n  return { type: 'business', tz, workDays, startMin, endMin, holidays: new Set((row.holidays || []).map(String)) };\n};\n// Opening window (UTC ms) of the local calendar day starting at UTC-midnight value dayMs, or null when closed\nconst windowOf = (dayMs, cal) => {\n  const dt = new Date(dayMs);\n  const y = dt.getUTCFullYear(), m = dt.getUTCMonth() + 1, d = dt.getUTCDate();\n  const dow = (dt.getUTCDay() + 6) % 7 + 1;\n  if (!cal.workDays.includes(dow) || cal.holidays.has(y + '-' + pad2(m) + '-' + pad2(d))) return null;\n  return [localToUtc(y, m, d, cal.startMin, cal.tz), localToUtc(y, m, d, cal.endMin, cal.tz)];\n};\nconst dayStartOf = (ms, tz) => { const p = partsOf(ms, tz); return Date.UTC(p.y, p.m - 1, p.d); };\nconst DAY = 86400000;\n// Business minutes between two instants (fractional)\nconst bizMinutes = (aMs, bMs, cal) => {\n  if (!(bMs > aMs)) return 0;\n  if (cal.type === '24x7') return (bMs - aMs) / 60000;\n  let total = 0, n = 0;\n  for (let t = dayStartOf(aMs, cal.tz), last = dayStartOf(bMs, cal.tz); t <= last && n < 1100; t += DAY, n++) {\n    const w = windowOf(t, cal);\n    if (!w) continue;\n    const lo = Math.max(aMs, w[0]), hi = Math.min(bMs, w[1]);\n    if (hi > lo) total += (hi - lo) / 60000;\n  }\n  return total;\n};\n// The instant at which `mins` business minutes have elapsed after startMs\nconst addBizMinutes = (startMs, mins, cal) => {\n  if (!(mins > 0)) return startMs;\n  if (cal.type === '24x7') return startMs + mins * 60000;\n  let left = mins;\n  for (let t = dayStartOf(startMs, cal.tz), n = 0; n < 800; t += DAY, n++) {\n    const w = windowOf(t, cal);\n    if (!w) continue;\n    const from = Math.max(startMs, w[0]);\n    if (from >= w[1]) continue;\n    const avail = (w[1] - from) / 60000;\n    if (left <= avail) return from + left * 60000;\n    left -= avail;\n  }\n  throw new Error('no working time found in the next 800 days (check the calendar and holidays)');\n};\nconst toMs = v => (v === null || v === undefined || v === '') ? null : new Date(v).getTime();\nconst iso = ms => new Date(Math.round(ms)).toISOString();\nconst S = v => (v === null || v === undefined) ? '' : (Object.prototype.toString.call(v) === '[object Date]' ? v.toISOString() : String(v));\nconst r3 = x => Math.round(x * 1000) / 1000;\n\nconst ev = $('Parse Event').first().json;\nconst t = $('Find Ticket').first().json || {};\nconst pol = $input.first().json || {};\nconst reject = (status, error) => [{ json: { ok: false, status, error } }];\nif (ev.type !== 'created' && !t.id) return reject(404, 'ticket not found');\nif (!pol.priority) return reject(400, 'unknown priority (no SLA policy)');\nlet cal;\ntry { cal = buildCal(pol, pol.calendar); } catch (e) { return reject(500, 'calendar misconfigured: ' + e.message); }\nconst now = Date.now();\n\nif (ev.type === 'created') {\n  let dResp, dRes;\n  try { dResp = addBizMinutes(now, Number(pol.first_response_min), cal); dRes = addBizMinutes(now, Number(pol.resolution_min), cal); }\n  catch (e) { return reject(500, e.message); }\n  return [{ json: { ok: true, action: 'create', params: [ev.external_id, ev.subject, ev.customer, ev.priority, ev.assignee, iso(dResp), iso(dRes)] } }];\n}\n\nconst cur = { status: t.status, fr: t.first_response_at, frMet: t.response_met, rAt: t.resolved_at, rMet: t.resolution_met,\n  remResp: t.response_remaining_min, remRes: t.resolution_remaining_min, dResp: t.response_due_at, dRes: t.resolution_due_at };\nconst next = { status: cur.status, fr: S(cur.fr), frMet: S(cur.frMet), rAt: S(cur.rAt), rMet: S(cur.rMet),\n  remResp: S(cur.remResp), remRes: S(cur.remRes), dResp: S(cur.dResp), dRes: S(cur.dRes) };\nconst conflict = m => reject(409, m);\nconst dResp = toMs(cur.dResp), dRes = toMs(cur.dRes);\n\ntry {\n  if (ev.type === 'first_response') {\n    if (cur.status !== 'open') return conflict('ticket is ' + cur.status + '; a first response needs an open ticket (resume it first)');\n    if (cur.fr) return conflict('first response was already recorded');\n    next.fr = iso(now); next.frMet = String(now <= dResp);\n  } else if (ev.type === 'pause') {\n    if (cur.status !== 'open') return conflict('only an open ticket can be paused (status is ' + cur.status + ')');\n    next.status = 'pending';\n    next.remResp = cur.fr ? '' : String(r3(Math.max(0, bizMinutes(now, dResp, cal))));\n    next.remRes = String(r3(Math.max(0, bizMinutes(now, dRes, cal))));\n    next.dResp = ''; next.dRes = '';\n  } else if (ev.type === 'resume') {\n    if (cur.status !== 'pending') return conflict('only a pending ticket can be resumed (status is ' + cur.status + ')');\n    next.status = 'open';\n    next.dResp = (cur.fr || next.remResp === '') ? '' : iso(addBizMinutes(now, Number(next.remResp), cal));\n    next.dRes = iso(addBizMinutes(now, Number(next.remRes), cal));\n    next.remResp = ''; next.remRes = '';\n  } else if (ev.type === 'resolve') {\n    if (cur.status === 'resolved') return conflict('ticket is already resolved');\n    const open = cur.status === 'open';\n    next.rMet = String(open ? now <= dRes : Number(cur.remRes) > 0);\n    if (!cur.fr) { next.fr = iso(now); next.frMet = String(open ? now <= dResp : Number(cur.remResp) > 0); }\n    next.status = 'resolved'; next.rAt = iso(now);\n    next.dResp = ''; next.dRes = ''; next.remResp = ''; next.remRes = '';\n  }\n} catch (e) { return reject(500, e.message); }\nreturn [{ json: { ok: true, action: 'update', params: [ev.external_id, Number(t.version), next.status, next.fr, next.frMet, next.rAt, next.rMet, next.remResp, next.remRes, next.dResp, next.dRes] } }];"
+      },
+      "id": "35e13fd0-3a3e-43e0-943f-21bd9c3fcc52",
+      "name": "Compute Change",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e686e26a-db50-4cc8-ac06-003c4cd19d79",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d0fb14ca-5d2a-4cb7-9f89-aabd19a62edd",
+      "name": "Change OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1560,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $json.error } }}",
+        "options": {
+          "responseCode": "={{ $json.status }}"
+        }
+      },
+      "id": "62c5f321-0da2-4e7e-83d7-5a39e457a617",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1820,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a26f288d-a963-4f6f-a354-350e900252e3",
+              "leftValue": "={{ $json.action === 'create' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "daf60efb-f09a-4a0e-afa9-adb1ba622b86",
+      "name": "Is Create?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO tickets (external_id, subject, customer, priority, assignee, response_due_at, resolution_due_at)\nVALUES ($1::text, $2::text, NULLIF($3::text, ''), $4::text, NULLIF($5::text, ''), $6::timestamptz, $7::timestamptz)\nON CONFLICT (external_id) DO NOTHING\nRETURNING id, external_id, priority, status, response_due_at, resolution_due_at;",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "75e2df57-661d-40d1-ab04-03b53baf90b7",
+      "name": "Create Ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2080,
+        20
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.id ? { status: 'created', ticket: $json.external_id, priority: $json.priority, response_due_at: $json.response_due_at, resolution_due_at: $json.resolution_due_at } : { status: 'duplicate', message: 'Ticket already exists' } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1f03cbef-bee1-41fc-baa0-4b5fad5c3bcc",
+      "name": "Respond Created",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2340,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets SET\n  status = $3::text,\n  first_response_at = NULLIF($4::text, '')::timestamptz,\n  response_met = NULLIF($5::text, '')::boolean,\n  resolved_at = NULLIF($6::text, '')::timestamptz,\n  resolution_met = NULLIF($7::text, '')::boolean,\n  response_remaining_min = NULLIF($8::text, '')::numeric,\n  resolution_remaining_min = NULLIF($9::text, '')::numeric,\n  response_due_at = NULLIF($10::text, '')::timestamptz,\n  resolution_due_at = NULLIF($11::text, '')::timestamptz,\n  version = version + 1,\n  updated_at = now()\nWHERE external_id = $1::text AND version = $2::int\nRETURNING id, external_id, status, version, first_response_at, response_met, resolved_at, resolution_met, response_due_at, resolution_due_at;",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "id": "2a19407d-4c66-403d-a797-6ff0e81a2015",
+      "name": "Update Ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2080,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.id ? { status: 'ok', ticket: $json.external_id, state: $json.status, response_due_at: $json.response_due_at, resolution_due_at: $json.resolution_due_at, response_met: $json.response_met, resolution_met: $json.resolution_met } : { status: 'conflict', error: 'The ticket changed at the same time. Retry the request.' } }}",
+        "options": {
+          "responseCode": "={{ $json.id ? 200 : 409 }}"
+        }
+      },
+      "id": "c5d1f18f-e875-404c-9f3f-cc0b6b387c78",
+      "name": "Respond Updated",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2340,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "2beeab79-0d9e-40d1-a77b-17862e7bb6b7",
+      "name": "Check Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        700
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a20a02ea-3239-4089-b437-809b38c9b32a",
+      "name": "Manual Check",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        860
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.timezone, c.work_days, c.start_minute, c.end_minute,\n       COALESCE((SELECT array_agg(to_char(h.day, 'YYYY-MM-DD')) FROM holidays h\n                 WHERE h.day BETWEEN current_date - 7 AND current_date + 400), ARRAY[]::text[]) AS holidays\nFROM business_calendar c;",
+        "options": {}
+      },
+      "id": "24ed5f1a-973a-4800-9b23-894845e31fef",
+      "name": "Load Calendar",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        780
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT t.id, t.external_id, t.subject, t.customer, t.priority, t.assignee, t.first_response_at,\n       t.response_due_at, t.resolution_due_at, t.response_alert_level, t.resolution_alert_level,\n       p.first_response_min, p.resolution_min, p.calendar\nFROM tickets t JOIN sla_policies p ON p.priority = t.priority\nWHERE t.status = 'open'\n  AND ((t.first_response_at IS NULL AND t.response_alert_level < 2) OR t.resolution_alert_level < 2)\nORDER BY LEAST(t.response_due_at, t.resolution_due_at)\nLIMIT 500;",
+        "options": {}
+      },
+      "id": "f20a1973-4a68-478b-ae22-24fef4432fd7",
+      "name": "Scan Open Tickets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        780
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- business calendar maths (time zone and DST aware, no external libraries) ----------\nconst _fmt = {};\nconst partsOf = (ms, tz) => {\n  const f = _fmt[tz] || (_fmt[tz] = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hourCycle: 'h23',\n    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }));\n  const o = {};\n  for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;\n  return { y: +o.year, m: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, s: +o.second };\n};\nconst tzOffsetMs = (ms, tz) => {\n  const p = partsOf(ms, tz);\n  return Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000;\n};\n// Wall-clock time in a zone -> UTC milliseconds (two passes settle the offset around DST changes)\nconst localToUtc = (y, m, d, minutes, tz) => {\n  const wall = Date.UTC(y, m - 1, d, 0, minutes);\n  const first = wall - tzOffsetMs(wall, tz);\n  return wall - tzOffsetMs(first, tz);\n};\nconst pad2 = n => String(n).padStart(2, '0');\nconst buildCal = (row, policyCalendar) => {\n  if (policyCalendar === '24x7') return { type: '24x7' };\n  const tz = String(row.timezone || '');\n  try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); } catch (e) { throw new Error('invalid time zone \"' + tz + '\"'); }\n  const workDays = (Array.isArray(row.work_days) ? row.work_days : []).map(Number).filter(n => n >= 1 && n <= 7);\n  const startMin = Number(row.start_minute), endMin = Number(row.end_minute);\n  if (!workDays.length) throw new Error('no working days configured');\n  if (!(startMin >= 0 && endMin <= 1440 && startMin < endMin)) throw new Error('invalid working hours');\n  return { type: 'business', tz, workDays, startMin, endMin, holidays: new Set((row.holidays || []).map(String)) };\n};\n// Opening window (UTC ms) of the local calendar day starting at UTC-midnight value dayMs, or null when closed\nconst windowOf = (dayMs, cal) => {\n  const dt = new Date(dayMs);\n  const y = dt.getUTCFullYear(), m = dt.getUTCMonth() + 1, d = dt.getUTCDate();\n  const dow = (dt.getUTCDay() + 6) % 7 + 1;\n  if (!cal.workDays.includes(dow) || cal.holidays.has(y + '-' + pad2(m) + '-' + pad2(d))) return null;\n  return [localToUtc(y, m, d, cal.startMin, cal.tz), localToUtc(y, m, d, cal.endMin, cal.tz)];\n};\nconst dayStartOf = (ms, tz) => { const p = partsOf(ms, tz); return Date.UTC(p.y, p.m - 1, p.d); };\nconst DAY = 86400000;\n// Business minutes between two instants (fractional)\nconst bizMinutes = (aMs, bMs, cal) => {\n  if (!(bMs > aMs)) return 0;\n  if (cal.type === '24x7') return (bMs - aMs) / 60000;\n  let total = 0, n = 0;\n  for (let t = dayStartOf(aMs, cal.tz), last = dayStartOf(bMs, cal.tz); t <= last && n < 1100; t += DAY, n++) {\n    const w = windowOf(t, cal);\n    if (!w) continue;\n    const lo = Math.max(aMs, w[0]), hi = Math.min(bMs, w[1]);\n    if (hi > lo) total += (hi - lo) / 60000;\n  }\n  return total;\n};\n// The instant at which `mins` business minutes have elapsed after startMs\nconst addBizMinutes = (startMs, mins, cal) => {\n  if (!(mins > 0)) return startMs;\n  if (cal.type === '24x7') return startMs + mins * 60000;\n  let left = mins;\n  for (let t = dayStartOf(startMs, cal.tz), n = 0; n < 800; t += DAY, n++) {\n    const w = windowOf(t, cal);\n    if (!w) continue;\n    const from = Math.max(startMs, w[0]);\n    if (from >= w[1]) continue;\n    const avail = (w[1] - from) / 60000;\n    if (left <= avail) return from + left * 60000;\n    left -= avail;\n  }\n  throw new Error('no working time found in the next 800 days (check the calendar and holidays)');\n};\nconst toMs = v => (v === null || v === undefined || v === '') ? null : new Date(v).getTime();\nconst iso = ms => new Date(Math.round(ms)).toISOString();\nconst S = v => (v === null || v === undefined) ? '' : (Object.prototype.toString.call(v) === '[object Date]' ? v.toISOString() : String(v));\nconst r3 = x => Math.round(x * 1000) / 1000;\n\nconst calRow = $('Load Calendar').first().json || {};\nconst rows = $input.all().map(i => i.json).filter(r => r && r.id);\nconst now = Date.now();\nconst WARN_AT = 0.2;           // warn when 20 % of the target (business minutes) is left\nconst out = [];\nfor (const r of rows) {\n  let cal;\n  try { cal = buildCal(calRow, r.calendar); } catch (e) { throw new Error('Calendar misconfigured: ' + e.message); }\n  const clocks = [\n    ['response', r.first_response_at ? null : toMs(r.response_due_at), Number(r.first_response_min), Number(r.response_alert_level)],\n    ['resolution', toMs(r.resolution_due_at), Number(r.resolution_min), Number(r.resolution_alert_level)]\n  ];\n  for (const [clock, due, target, stored] of clocks) {\n    if (due === null) continue;\n    const level = now >= due ? 2 : (bizMinutes(now, due, cal) <= WARN_AT * target ? 1 : 0);\n    if (level > stored) out.push({ json: { id: r.id, external_id: r.external_id, subject: r.subject, customer: r.customer || '', priority: r.priority,\n      assignee: r.assignee || '', clock, level, due_at: iso(due) } });\n  }\n}\nreturn out;"
+      },
+      "id": "e65c1828-b5e4-42b1-b37a-40baf53b6021",
+      "name": "Evaluate SLAs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        780
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets SET\n  response_alert_level = CASE WHEN $2::text = 'response' THEN GREATEST(response_alert_level, $3::int) ELSE response_alert_level END,\n  resolution_alert_level = CASE WHEN $2::text = 'resolution' THEN GREATEST(resolution_alert_level, $3::int) ELSE resolution_alert_level END\nWHERE id = $1::bigint AND status = 'open'\n  AND (($2::text = 'response' AND response_alert_level < $3::int) OR ($2::text = 'resolution' AND resolution_alert_level < $3::int))\nRETURNING id, external_id, subject, customer, priority, assignee, $2::text AS clock, $3::int AS level;",
+        "options": {
+          "queryReplacement": "={{ [ $json.id, $json.clock, $json.level ] }}"
+        }
+      },
+      "id": "70b5b573-01dd-407f-a5f5-735aa03408c4",
+      "name": "Apply Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1040,
+        780
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = x => String(x === null || x === undefined ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst rows = $input.all().map(i => i.json).filter(r => r && r.id);\nif (!rows.length) return [];\nconst line = r => '#' + esc(r.external_id) + ' [' + esc(r.priority) + '] ' + esc(r.subject) + (r.customer ? ' (' + esc(r.customer) + ')' : '')\n  + ' · ' + esc(r.clock) + (r.assignee ? ' · ' + esc(r.assignee) : ' · unassigned');\nconst breached = rows.filter(r => Number(r.level) === 2), warned = rows.filter(r => Number(r.level) === 1);\nconst L = [];\nif (breached.length) { L.push('🔴 <b>SLA breached (' + breached.length + ')</b>'); for (const r of breached.slice(0, 12)) L.push(line(r)); if (breached.length > 12) L.push('and ' + (breached.length - 12) + ' more'); }\nif (warned.length) { if (L.length) L.push(''); L.push('🟠 <b>SLA at risk (' + warned.length + ')</b>'); for (const r of warned.slice(0, 12)) L.push(line(r)); if (warned.length > 12) L.push('and ' + (warned.length - 12) + ' more'); }\nreturn [{ json: { text: L.join('\\n').slice(0, 3800) } }];"
+      },
+      "id": "4ecb08fe-244d-4279-998e-8b67068f8bf6",
+      "name": "Format Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        780
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_SUPPORT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "7f721c30-899a-456c-9170-bfbe44c89a3e",
+      "name": "Send Alerts",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1560,
+        780
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "e5e8d119-2520-4602-a583-fa90fdba37dd",
+      "name": "Report Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.priority,\n  COUNT(t.id) FILTER (WHERE t.status = 'open')::int AS open,\n  COUNT(t.id) FILTER (WHERE t.status = 'pending')::int AS pending,\n  COUNT(t.id) FILTER (WHERE t.status = 'open' AND (t.response_alert_level = 2 OR t.resolution_alert_level = 2))::int AS breached_open,\n  COUNT(t.id) FILTER (WHERE t.resolved_at > now() - interval '24 hours')::int AS resolved_24h,\n  COUNT(t.id) FILTER (WHERE t.resolved_at > now() - interval '24 hours' AND t.resolution_met)::int AS resolution_met_24h,\n  COUNT(t.id) FILTER (WHERE t.first_response_at > now() - interval '24 hours')::int AS responded_24h,\n  COUNT(t.id) FILTER (WHERE t.first_response_at > now() - interval '24 hours' AND t.response_met)::int AS response_met_24h,\n  ROUND((AVG(EXTRACT(EPOCH FROM (t.first_response_at - t.created_at)) / 60)\n         FILTER (WHERE t.first_response_at > now() - interval '24 hours'))::numeric, 0) AS avg_first_response_min\nFROM sla_policies p LEFT JOIN tickets t ON t.priority = p.priority\nGROUP BY p.priority, p.first_response_min\nORDER BY p.first_response_min;",
+        "options": {}
+      },
+      "id": "256638c6-784c-4bc2-9aa6-f46d84cc648f",
+      "name": "Report Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = x => String(x === null || x === undefined ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst rows = $input.all().map(i => i.json).filter(r => r && r.priority);\nconst n = v => Number(v) || 0;\nif (!rows.length || rows.every(r => !n(r.open) && !n(r.pending) && !n(r.resolved_24h))) return [];\nconst pct = (a, b) => b ? Math.round(100 * a / b) + '%' : '-';\nconst L = ['📊 <b>Support SLA, last 24 hours</b>', ''];\nfor (const r of rows) {\n  L.push('<b>' + esc(r.priority) + '</b>: ' + n(r.open) + ' open' + (n(r.breached_open) ? ' (' + n(r.breached_open) + ' breached)' : '') + ', ' + n(r.pending) + ' waiting, '\n    + n(r.resolved_24h) + ' resolved, resolution SLA ' + pct(n(r.resolution_met_24h), n(r.resolved_24h))\n    + ', first response SLA ' + pct(n(r.response_met_24h), n(r.responded_24h))\n    + (r.avg_first_response_min !== null && r.avg_first_response_min !== undefined ? ', avg first response ' + Math.round(Number(r.avg_first_response_min)) + ' min (wall clock)' : ''));\n}\nconst tot = rows.reduce((a, r) => ({ res: a.res + n(r.resolved_24h), met: a.met + n(r.resolution_met_24h), open: a.open + n(r.open), br: a.br + n(r.breached_open) }), { res: 0, met: 0, open: 0, br: 0 });\nL.push('', 'Total: ' + tot.open + ' open, ' + tot.br + ' breached, resolution SLA ' + pct(tot.met, tot.res));\nreturn [{ json: { text: L.join('\\n').slice(0, 3800) } }];"
+      },
+      "id": "0267341a-d9b3-45d8-979a-3ae241c4befd",
+      "name": "Format Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_SUPPORT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "1d3f01ca-e633-43dd-aec3-9c0afca0ea42",
+      "name": "Send Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        780,
+        1300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "4d44e6cc-582f-4148-8ff7-e6e1764f5e1d",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const e = $input.first().json;\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || 'unknown error';\nconst url = (e.execution && e.execution.url) || '';\nreturn [{ json: { text: 'WORKFLOW ERROR\\n\\nWorkflow: ' + wf + '\\nFailed node: ' + node + '\\nError: ' + String(msg).slice(0, 500) + (url ? '\\n' + url : '') } }];"
+      },
+      "id": "379da886-2f51-42a0-a494-91ec77b760ce",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_SUPPORT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "32db2586-4349-4b7d-a022-6a9bbde1fa83",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        1600
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook SLA Event": {
+      "main": [
+        [
+          {
+            "node": "Parse Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Event": {
+      "main": [
+        [
+          {
+            "node": "Event Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Valid?": {
+      "main": [
+        [
+          {
+            "node": "Find Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Ticket": {
+      "main": [
+        [
+          {
+            "node": "Load Policy and Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Policy and Calendar": {
+      "main": [
+        [
+          {
+            "node": "Compute Change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Change": {
+      "main": [
+        [
+          {
+            "node": "Change OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Change OK?": {
+      "main": [
+        [
+          {
+            "node": "Is Create?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Create?": {
+      "main": [
+        [
+          {
+            "node": "Create Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Ticket": {
+      "main": [
+        [
+          {
+            "node": "Respond Created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Ticket": {
+      "main": [
+        [
+          {
+            "node": "Respond Updated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Schedule": {
+      "main": [
+        [
+          {
+            "node": "Load Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Check": {
+      "main": [
+        [
+          {
+            "node": "Load Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Calendar": {
+      "main": [
+        [
+          {
+            "node": "Scan Open Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scan Open Tickets": {
+      "main": [
+        [
+          {
+            "node": "Evaluate SLAs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate SLAs": {
+      "main": [
+        [
+          {
+            "node": "Apply Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Alert": {
+      "main": [
+        [
+          {
+            "node": "Format Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alerts": {
+      "main": [
+        [
+          {
+            "node": "Send Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Schedule": {
+      "main": [
+        [
+          {
+            "node": "Report Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Query": {
+      "main": [
+        [
+          {
+            "node": "Format Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report": {
+      "main": [
+        [
+          {
+            "node": "Send Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "active": false,
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
